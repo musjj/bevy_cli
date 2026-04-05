@@ -8,6 +8,7 @@ use std::{
     iter,
     path::PathBuf,
     process::{Command, ExitCode},
+    thread,
 };
 
 use anyhow::{Context, ensure};
@@ -23,20 +24,19 @@ struct Args {
     /// If true, runs `cargo fix` instead of `cargo check`.
     fix: bool,
 
+    /// If true, run `cargo clippy` in parallel with `cargo check`. If `--fix` is also passed,
+    /// `cargo clippy --fix` and `cargo fix` will be run sequentially in that order.
+    clippy: bool,
+
     /// The remaining arguments to forward to `cargo check` or `cargo fix`.
     cargo_args: Vec<OsString>,
 }
 
-fn main() -> anyhow::Result<ExitCode> {
-    let args = parse_args();
-
-    // Find the path to `bevy_lint_driver`.
-    let driver_path = driver_path()?;
-
+fn cargo() -> anyhow::Result<Command> {
     // Find the path to the custom sysroot, if specified.
     let custom_sysroot = custom_sysroot()?;
 
-    let mut cargo = match custom_sysroot {
+    match custom_sysroot {
         // When there's a custom sysroot, run `$SYSROOT/bin/cargo`.
         Some(sysroot) => {
             let cargo = sysroot
@@ -78,7 +78,7 @@ fn main() -> anyhow::Result<ExitCode> {
             // a custom sysroot we have to do it ourselves.
             c.env(path_name, appended_paths);
 
-            c
+            Ok(c)
         }
         // When using Rustup, run `rustup run $TOOLCHAIN cargo`.
         None => {
@@ -103,8 +103,46 @@ fn main() -> anyhow::Result<ExitCode> {
                 // <https://github.com/rust-lang/rustup/pull/4249>.
                 .env("RUSTUP_WINDOWS_PATH_ADD_BIN", "1");
 
-            c
+            Ok(c)
         }
+    }
+}
+
+fn main() -> anyhow::Result<ExitCode> {
+    let args = parse_args();
+
+    // Find the path to `bevy_lint_driver`.
+    let driver_path = driver_path()?;
+
+    let mut clippy_handle = if args.clippy {
+        let mut clippy_args = args.cargo_args.clone();
+        if args.fix {
+            clippy_args.push("--fix".into());
+        }
+        Some(thread::spawn(|| {
+            cargo().map(|mut cargo| {
+                cargo
+                    .arg("clippy")
+                    // Forward all arguments to `cargo check` except for the first, which is the
+                    // path to the current executable.
+                    .args(clippy_args)
+                    .status()
+                    .context("failed to spawn `cargo clippy`")
+            })
+        }))
+    } else {
+        None
+    };
+
+    let mut clippy_status = if args.fix {
+        let clippy_handle = clippy_handle.take();
+        if let Some(handle) = clippy_handle {
+            Some(handle.join().unwrap()??)
+        } else {
+            None
+        }
+    } else {
+        None
     };
 
     let cargo_subcommand = match args.fix {
@@ -112,7 +150,7 @@ fn main() -> anyhow::Result<ExitCode> {
         false => "check",
     };
 
-    let status = cargo
+    let status = cargo()?
         // Usually this is `cargo check`, but it can be `cargo fix` if the `--fix` flag is passed.
         .arg(cargo_subcommand)
         // Forward all arguments to `cargo check` except for the first, which is the path to the
@@ -124,17 +162,27 @@ fn main() -> anyhow::Result<ExitCode> {
         .status()
         .context("failed to spawn `cargo check`")?;
 
-    let code = if status.success() {
+    if let Some(handle) = clippy_handle {
+        clippy_status = Some(handle.join().unwrap()??);
+    }
+
+    // Discard `clippy`'s status code if it ran successfully
+    let chosen_status = clippy_status
+        .filter(|&status| !status.success())
+        .unwrap_or(status);
+
+    let code = if chosen_status.success() {
         // Exit status of 0, success!
         0
     } else {
         // Print out `cargo`'s exit code on failure.
-        eprintln!("Check failed: {status}.");
+        eprintln!("Check failed: {chosen_status}.");
 
-        // Extract the exit code. `ExitCode` only supports being created from a `u8`, so we truncate
-        // the bits. Additionally, `ExitStatus::code()` can return `None` on Unix if it was
-        // terminated by a signal. In those cases, we just default to 1.
-        status.code().unwrap_or(1) as u8
+        // Extract the exit code. `ExitCode` only supports being created from a `u8`, so we
+        // truncate the bits. Additionally, `ExitStatus::code()` can return `None`
+        // on Unix if it was terminated by a signal. In those cases, we just default
+        // to 1.
+        chosen_status.code().unwrap_or(1) as u8
     };
 
     // Return `cargo`'s exit code.
@@ -159,6 +207,8 @@ fn parse_args() -> Args {
 
     Args {
         fix: parser.contains("--fix"),
+
+        clippy: parser.contains("--clippy"),
 
         // Collect remaining arguments in a list to be passed to Cargo.
         cargo_args: parser.finish(),
